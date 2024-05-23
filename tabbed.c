@@ -2,8 +2,12 @@
  * See LICENSE file for copyright and license details.
  */
 
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <locale.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -47,6 +51,10 @@
 #define LENGTH(x)               (sizeof((x)) / sizeof(*(x)))
 #define CLEANMASK(mask)         (mask & ~(numlockmask | LockMask))
 #define TEXTW(x)                (textnw(x, strlen(x)) + dc.font.height)
+#define streq(s1, s2)           (strcmp((s1), (s2)) == 0)
+
+/* UNIX Socket settings */
+#define SOCKET_PATH_TPL  "/tmp/tabbed_%s-socket"
 
 enum { ColFG, ColBG, ColLast };       /* color */
 enum { WMProtocols, WMDelete, WMName, WMState, WMFullscreen,
@@ -56,13 +64,6 @@ typedef union {
 	int i;
 	const void *v;
 } Arg;
-
-typedef struct {
-	unsigned int mod;
-	KeySym keysym;
-	void (*func)(const Arg *);
-	const Arg arg;
-} Key;
 
 typedef struct {
 	int x, y, w, h;
@@ -111,6 +112,7 @@ static int getclient(Window w);
 static XftColor getcolor(const char *colstr);
 static int getfirsttab(void);
 static Bool gettextprop(Window w, Atom atom, char *text, unsigned int size);
+static void handle_message(char *msg, int msg_len, FILE *rsp, int sock_fd);
 static void initfont(const char *fontstr);
 static Bool isprotodel(int c);
 static void keypress(const XEvent *e);
@@ -119,6 +121,7 @@ static void manage(Window win);
 static void maprequest(const XEvent *e);
 static void move(const Arg *arg);
 static void movetab(const Arg *arg);
+static void process_message(char **args, int num, FILE *rsp, int sock_fd);
 static void propertynotify(const XEvent *e);
 static void resize(int c, int w, int h);
 static void rotate(const Arg *arg);
@@ -148,7 +151,6 @@ static void (*handler[LASTEvent]) (const XEvent *) = {
 	[DestroyNotify] = destroynotify,
 	[Expose] = expose,
 	[FocusIn] = focusin,
-	[KeyPress] = keypress,
 	[MapRequest] = maprequest,
 	[PropertyNotify] = propertynotify,
 };
@@ -169,6 +171,8 @@ static char winid[64];
 static char **cmd;
 static char *wmname = "tabbed";
 static const char *geometry;
+static int sock_fd = -1;
+static char socket_path[256];
 
 char *argv0;
 
@@ -228,6 +232,9 @@ cleanup(void)
 	XDestroyWindow(dpy, win);
 	XSync(dpy, False);
 	free(cmd);
+
+	close(sock_fd);
+	unlink(socket_path);
 }
 
 void
@@ -658,22 +665,6 @@ isprotodel(int c)
 }
 
 void
-keypress(const XEvent *e)
-{
-	const XKeyEvent *ev = &e->xkey;
-	unsigned int i;
-	KeySym keysym;
-
-	keysym = XkbKeycodeToKeysym(dpy, (KeyCode)ev->keycode, 0, 0);
-	for (i = 0; i < LENGTH(keys); i++) {
-		if (keysym == keys[i].keysym &&
-		    CLEANMASK(keys[i].mod) == CLEANMASK(ev->state) &&
-		    keys[i].func)
-			keys[i].func(&(keys[i].arg));
-	}
-}
-
-void
 killclient(const Arg *arg)
 {
 	XEvent ev;
@@ -712,16 +703,6 @@ manage(Window w)
 		XSelectInput(dpy, w, PropertyChangeMask |
 		             StructureNotifyMask | EnterWindowMask);
 		XSync(dpy, False);
-
-		for (i = 0; i < LENGTH(keys); i++) {
-			if ((code = XKeysymToKeycode(dpy, keys[i].keysym))) {
-				for (j = 0; j < LENGTH(modifiers); j++) {
-					XGrabKey(dpy, code, keys[i].mod |
-					         modifiers[j], w, True,
-					         GrabModeAsync, GrabModeAsync);
-				}
-			}
-		}
 
 		c = ecalloc(1, sizeof *c);
 		c->win = w;
@@ -920,6 +901,152 @@ rotate(const Arg *arg)
 }
 
 void
+handle_message(char *msg, int msg_len, FILE *rsp, int sock_fd)
+{
+	int cap = 8;
+	int num = 0;
+	char **args = calloc(cap, sizeof(char *));
+
+	if (args == NULL) {
+		perror("Handle message: calloc");
+		return;
+	}
+
+	for (int i = 0, j = 0; i < msg_len; i++) {
+		if (msg[i] == 0) {
+			args[num++] = msg + j;
+			j = i + 1;
+		}
+		if (num >= cap) {
+			cap *= 2;
+			char **new = realloc(args, cap * sizeof(char *));
+			if (new == NULL) {
+				free(args);
+				perror("Handle message: realloc");
+				return;
+			} else {
+				args = new;
+			}
+		}
+	}
+
+	if (num < 1) {
+		free(args);
+		perror("No arguments given.");
+		return;
+	}
+
+	char **args_orig = args;
+	process_message(args, num, rsp, sock_fd);
+	free(args_orig);
+}
+
+void
+process_message(char **args, int num, FILE *rsp, int sock_fd)
+{
+	char buf[256];
+	Arg arg;
+	if (streq("rotate", *args)) {
+		if (num == 2) {
+			args++;
+			arg.i = atoi(*args);
+			rotate(&arg);
+		} else {
+			arg.i = 1;
+			rotate(&arg);
+		}
+	} else if (streq("movetab", *args)) {
+		if (num == 2) {
+			args++;
+			arg.i = atoi(*args);
+			movetab(&arg);
+		}
+	} else if (streq("move", *args)) {
+		if (num == 2) {
+			args++;
+			arg.i = atoi(*args);
+			move(&arg);
+		}
+	} else if (streq("toggle", *args)) {
+		arg.v = (void*)&urgentswitch;
+		toggle(&arg);
+	} else if (streq("killclient", *args)) {
+		arg.i = 0;
+		killclient(&arg);
+	} else if (streq("focusonce", *args)) {
+		arg.i = 0;
+		focusonce(&arg);
+	} else if (streq("focusurgent", *args)) {
+		arg.i = 0;
+		focusurgent(&arg);
+	} else if (streq("spawn", *args)) {
+		arg.i = 0;
+		spawn(&arg);
+	} else if (streq("fullscreen", *args)) {
+		arg.i = 0;
+		fullscreen(&arg);
+	} else if (streq("isfirst", *args)) {
+		if (sel == 0) {
+			write(sock_fd, "1", 1);
+		} else {
+			write(sock_fd, "0", 1);
+		}
+	} else if (streq("islast", *args)) {
+		if (nclients > 0 && sel == (nclients-1)) {
+			write(sock_fd, "1", 1);
+		} else {
+			write(sock_fd, "0", 1);
+		}
+	} else if (streq("isempty", *args)) {
+		if (nclients == 0) {
+			write(sock_fd, "1", 1);
+		} else {
+			write(sock_fd, "0", 1);
+		}
+	} else if (streq("totaltabs", *args)) {
+		if (nclients > 0) {
+			snprintf(buf, sizeof(buf), "%d", nclients);
+			write(sock_fd, buf, strlen(buf));
+		} else {
+			write(sock_fd, "0", 1);
+		}
+	} else if (streq("tabnumber", *args)) {
+		snprintf(buf, sizeof(buf), "%d", sel);
+		write(sock_fd, buf, strlen(buf));
+	}
+	fflush(rsp);
+	fclose(rsp);
+}
+
+void *
+socket_run(void *vargp)
+{
+	fd_set descriptors;
+	int cli_fd, n;
+	char msg[BUFSIZ] = {0};
+
+	while (running) {
+		FD_ZERO(&descriptors);
+		FD_SET(sock_fd, &descriptors);
+
+		if (FD_ISSET(sock_fd, &descriptors)) {
+			cli_fd = accept(sock_fd, NULL, 0);
+			if (cli_fd > 0 && (n = recv(cli_fd, msg, sizeof(msg)-1, 0)) > 0) {
+				msg[n] = '\0';
+				FILE *rsp = fdopen(cli_fd, "w");
+				if (rsp != NULL) {
+					handle_message(msg, n, rsp, cli_fd);
+				} else {
+					fprintf(stderr, "warn: Can't open the client socket as file.\n");
+				}
+				close(cli_fd);
+			}
+		}
+	}
+	return NULL;
+}
+
+void
 run(void)
 {
 	XEvent ev;
@@ -929,6 +1056,9 @@ run(void)
 	drawbar();
 	if (doinitspawn == True)
 		spawn(NULL);
+
+	pthread_t thread_id;
+	pthread_create(&thread_id, NULL, socket_run, NULL);
 
 	while (running) {
 		XNextEvent(dpy, &ev);
@@ -1083,6 +1213,35 @@ setup(void)
 
 	nextfocus = foreground;
 	focus(-1);
+
+	/* Setup UNIX socket */
+	struct sockaddr_un sock_address;
+	if (sock_fd == -1) {
+		snprintf(socket_path, sizeof(socket_path), SOCKET_PATH_TPL, winid);
+
+		sock_address.sun_family = AF_UNIX;
+		if (snprintf(sock_address.sun_path, sizeof(sock_address.sun_path), "%s", socket_path) < 0) {
+			fprintf(stderr, "Couldn't write the socket path.\n");
+		}
+
+		sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+		if (sock_fd == -1) {
+			fprintf(stderr, "Couldn't create the socket.\n");
+		}
+
+		unlink(socket_path);
+
+		if (bind(sock_fd, (struct sockaddr *) &sock_address, sizeof(sock_address)) == -1) {
+			fprintf(stderr, "Couldn't bind a name to the socket.\n");
+		}
+
+		if (listen(sock_fd, SOMAXCONN) == -1) {
+			fprintf(stderr, "Couldn't listen to the socket.\n");
+		}
+	}
+
+	fcntl(sock_fd, F_SETFD, FD_CLOEXEC | fcntl(sock_fd, F_GETFD));
 }
 
 void
@@ -1285,6 +1444,8 @@ main(int argc, char *argv[])
 	Bool detach = False;
 	int replace = 0;
 	char *pstr;
+
+	XInitThreads();
 
 	ARGBEGIN {
 	case 'c':
