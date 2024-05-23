@@ -20,3 +20,7 @@ Running tabbed
 --------------
 See the man page for details.
 
+Added patches
+-------------
+UNIX Socket Control: https://tools.suckless.org/tabbed/patches/unix-socket-control/
+Alpha: https://tools.suckless.org/tabbed/patches/alpha/
