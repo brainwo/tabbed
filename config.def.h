@@ -3,9 +3,9 @@
 /* appearance */
 static const char font[]        = "NotoSans NF:size=10";
 static const char* normbgcolor  = "#2f343f";
-static const char* normfgcolor  = "#eeeeee";
+static const char* normfgcolor  = "#bababa";
 static const char* selbgcolor   = "#565965";
-static const char* selfgcolor   = "#ffffff";
+static const char* selfgcolor   = "#dedede";
 static const char* urgbgcolor   = "#111111";
 static const char* urgfgcolor   = "#cc0000";
 static const char before[]      = "<";
